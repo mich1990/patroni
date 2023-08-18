@@ -2,7 +2,7 @@ import logging
 
 from contextlib import contextmanager
 from threading import Lock
-from typing import Any, Dict, Iterator, List, Union, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Union, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
     from psycopg import Connection as Connection3, Cursor
     from psycopg2 import connection, cursor
@@ -21,17 +21,17 @@ class Connection:
 
     server_version: int
 
-    def __init__(self) -> None:
+    def __init__(self, pool: 'ConnectionPool', name: str, kwargs_override: Optional[Dict[str, Any]]) -> None:
         """Create an instance of :class:`Connection` class."""
+        self._pool = pool
+        self._name = name
+        self._kwargs_override = kwargs_override or {}
         self._lock = Lock()  # used to make sure that only one connection to postgres is established
         self._connection = None
 
-    def set_conn_kwargs(self, conn_kwargs: Dict[str, Any]) -> None:
-        """Set connection parameters, like user, password, host, port and so on.
-
-        :param conn_kwargs: connection parameters as a dictionary.
-        """
-        self._conn_kwargs = conn_kwargs
+    @property
+    def _conn_kwargs(self) -> Dict[str, Any]:
+        return {**self._pool.conn_kwargs, **self._kwargs_override}
 
     def get(self) -> Union['connection', 'Connection3[Any]']:
         """Get ``psycopg``/``psycopg2`` connection object.
@@ -43,7 +43,7 @@ class Connection:
         """
         with self._lock:
             if not self._connection or self._connection.closed != 0:
-                logger.info("establishing a new patroni connection to postgres")
+                logger.info("establishing a new patroni %s connection to postgres", self._name)
                 self._connection = psycopg.connect(**self._conn_kwargs)
                 self.server_version = getattr(self._connection, 'server_version', 0)
         return self._connection
@@ -76,12 +76,45 @@ class Connection:
                     raise exc
             raise PostgresConnectionException('connection problems') from exc
 
-    def close(self) -> None:
+    def close(self, silent: bool = False) -> bool:
         """Close the psycopg connection to postgres."""
+        ret = False
         if self._connection and self._connection.closed == 0:
             self._connection.close()
-            logger.info("closed patroni connection to postgres")
+            if not silent:
+                logger.info("closed patroni %s connection to postgres", self._name)
+            ret = True
         self._connection = None
+        return ret
+
+
+class ConnectionPool:
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._connections: Dict[str, Connection] = {}
+        self._conn_kwargs: Dict[str, Any] = {}
+
+    @property
+    def conn_kwargs(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._conn_kwargs.copy()
+
+    @conn_kwargs.setter
+    def conn_kwargs(self, value: Dict[str, Any]) -> None:
+        with self._lock:
+            self._conn_kwargs = value
+
+    def get(self, name: str, kwargs_override: Optional[Dict[str, Any]] = None) -> Connection:
+        with self._lock:
+            if name not in self._connections:
+                self._connections[name] = Connection(self, name, kwargs_override)
+        return self._connections[name]
+
+    def close(self) -> None:
+        with self._lock:
+            if any(conn.close(True) for conn in self._connections.values()):
+                logger.info("closed patroni connections to postgres")
 
 
 @contextmanager
